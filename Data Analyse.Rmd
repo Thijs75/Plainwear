@@ -1,0 +1,258 @@
+---
+title: "Plainwear"
+author: "Tyco Hendriks"
+date: "4/5/2022"
+output: html_document
+---
+
+```{r, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(DBI)
+library(odbc)
+library(lubridate)
+```
+
+```{r}
+con <- DBI::dbConnect(
+  odbc::odbc(),
+  .connection_string = "Driver={ODBC Driver 17 for SQL Server}; Server=Macbook-Air-van-Tyco.local;Database=Fontys3;Uid=sa;Pwd=MyPass@word;"
+)
+
+calendar <- DBI::dbGetQuery(con,'select * from Calendar')
+location <- DBI::dbGetQuery (con, 'select * from Location')
+product <- DBI::dbGetQuery (con, 'select * from Product')
+refit <- DBI::dbGetQuery (con, 'select * from Refit')
+salestransaction <- DBI::dbGetQuery (con, 'select * from SalesTransaction')
+supplier <- DBI::dbGetQuery (con, 'select * from Supplier')
+```
+
+SQL code. Probeer je tabellen zo klein mogelijk te houden.
+```{sql connection=con, output.var = sales}
+
+```
+
+PERFORMANCE PLAINWEAR CFO
+
+1. JOINEN 
+    Alle tabellen joinen tot een grote tabel waar je alles mee kan tot op de performance op 'Size' niveau.
+2. LABEL
+    Winkel labelen wanneer deze open of gesloten zijn.
+3. L4L
+    Omzet groei berekenen op maand niveau per:
+      a. continent
+      b. land
+      c. stad
+      d. type store
+      e. winkel
+      f. brand
+      g. product groep
+      h. product subgroep
+      i. size
+4. SHINY
+    Maak een shiny template waarin je:
+      a. kunt inzoomen van a tm i
+      b. direct omzet kunt afzetten tegen a tm i
+
+
+
+1. JOINEN
+
+
+*Past de refit tabel aan zodat deze de maanden afrondt naar volledige maanden. Dit is van belang om een L4L te kunnen berekenen waarbij niet een halve maand ook wordt meegenomen*
+```{r}
+refit_maanden <- refit %>%
+  mutate(OpenedDate_dt = as.Date(OpenedDate),
+  ClosedDate_dt = as.Date(ClosedDate),
+  ceil_opened = ceiling_date(OpenedDate_dt, unit="month")-1, 
+  floor_closed = floor_date(ClosedDate_dt, unit="month")) %>% 
+  select(-OpenedDate, -ClosedDate) %>% 
+  mutate(jaar_open = year(ceil_opened), maand_open = month(ceil_opened)) %>% 
+  mutate(jaar_closed = year(floor_closed), maand_closed = month(floor_closed))
+```
+
+*Verkleint de calendar tabel tot 20015-2019*
+```{r}
+calendar <- calendar %>% 
+  filter(Jaar %in% c(2015,2016,2017,2018,2019))
+```
+
+*Past de salestransaction tabel aan zodat deze 0 waardes bevat voor de dagen waarop geen sales waren voor de stores.*
+```{r}
+salestransaction <- salestransaction %>%
+  mutate(jaar= year(Date),maand = month(Date)) %>% 
+  group_by(StoreID, jaar, maand) %>% 
+  mutate(revenue = sum(AmountGC)) %>%
+  arrange(StoreID, jaar, maand) %>% 
+  ungroup() %>% 
+  complete(StoreID, jaar, maand, fill=list(n=0))
+```
+
+*Maakt een volledige tabel met de sales, producten en stores informatie bij elkaar zodat we straks deze mastertabel voor al onze berekeningen kunnen gebruiken*
+de "Masterjoin"
+```{r}
+masterjoin <- salestransaction %>% 
+  left_join(product, by = "ProductID") %>% 
+  left_join(stores, by="StoreID")
+
+```
+
+*Hier voeg ik de refit_maanden tabel toe om te laten zien waar de winkel gesloten wordt en weer open gaat*
+```{r}
+# hier join ik de refit tabel op jaar_closed en maand_closed, verwijder ik overbodige kolommen en maak ik een nieuw dataframe
+masterjoin <- masterjoin %>% 
+  left_join(refit_maanden, by= c("StoreID", "jaar" = "jaar_closed", "maand" = "maand_closed")) %>% 
+  select(-jaar_open, -maand_open, -ceil_opened,-OpenedDate_dt, -ClosedDate_dt)
+
+#hier join ik de refit tabel op jaar_open en maand_open, verwijder ik overbodige kolommen en maak ik een nieuw dataframe
+masterjoin <- masterjoin %>% 
+  left_join(refit_maanden, by= c("StoreID", "jaar" = "jaar_open", "maand" = "maand_open")) %>% 
+  select(-RefitID.y, -OpenedDate_dt, -ClosedDate_dt, -jaar_closed, -maand_closed, -floor_closed.y)
+```
+
+
+
+
+2. LABEL
+
+
+
+
+Hier maak ik een label aan van closed of open en assign ik dit naar een nieuw dataframe
+```{r}
+masterjoin <- masterjoin %>%
+  #wanneer de revenue NA is dan betekent dit dat de winkel gesloten is. Wanneer er een waarde staat in de floor_closed.x of de ceil_opened kolom, dan betekent dit dat de winkel een refit heeft. Anders is de winkel open.
+  mutate(label = case_when(
+    is.na(revenue) ~ "Closed",
+    !is.na(floor_closed.x) | !is.na(ceil_opened) ~ "Refit",
+    TRUE ~ "Open"
+  ))
+```
+
+
+
+
+3. L4L
+
+
+Ik wil het verschil met een maand een jaar eerder kunnen berekenen. De L4L methode. 
+*Maak een nieuwe tabel met mutate waarin je de huidige maand doet min dezelfde maand het jaar eerder *
+```{r}
+#L4L verschil kolom---
+masterjoin <- masterjoin %>% 
+  mutate(verschil = revenue - lag(revenue, 12))
+```
+
+Ik wil het proportionele verschil met een maand een jaar eerder kunnen berekenen. De L4L methode. 
+*Het proportionele verschil bereken je door Nieuw-oud/oud te doen. Dus verschil/lag(revenue, 12)  *
+```{r}
+masterjoin <- masterjoin %>%
+  mutate(prop = (100*(verschil/lag(revenue, 12))))
+```
+Ik wil het procentuele verschil met een maand een jaar eerder kunnen berekenen. De L4L methode. 
+*Het procentuele verschil bereken door scales::percent te doen van de prop *
+```{r}
+masterjoin <- masterjoin %>%
+  mutate(groei_omzet_winkel = (prop))
+```
+
+
+
+
+
+
+Wanneer je nu de omzet per jaar wil berekenen van alle winkels samen zonder de ruis van de refits, dan kun je een filter toepassen waarmee je alleen de winkels met het label "Open" meeneemt in de berekening.
+```{r}
+masterjoin %>%
+  filter(label == "Open") %>% 
+  group_by(jaar) %>% 
+  summarise(totaal_omzet = sum(revenue, na.rm=TRUE))
+```
+Als je de performance wilt berekenen van de winkels aan de hand van de groei, dan moet je werken met een gemiddelde groei per winkel per maand over een maand van een jaar geleden en kijken of de individuele winkel ten opzichte van dit gemiddelde erboven of eronder zit. De ruis filter moet hierbij aanstaan.
+
+Hoe groei vergelijken L4L?
+Winkel groei met zichzelf
+winkel A 2015 met winkel A 2016 verschil(1) berekenen. > winkel A 2016 met winkel A 2017 verschil(2) berekenen.
+   het verschil tussen verschil(1) en verschil(2). Bij positief dan meer groei, bij negatief minder groei.
+*Filter alle maanden eruit waarbij er geen groei is omdat deze nog niet geopend waren. Deze hebben de waarde NA. Bereken vervolgens de som van alle prop waardes gedeelde door het aantal deelnemers(stores). Dit is de gemiddelde groei per maand.*
+```{r}
+#het verschil van de tot omzet per maand van alle winkels samen
+groei_omzet_winkel<- masterjoin %>%
+  filter(label == "Open")%>%
+  group_by(jaar, maand) %>% 
+  mutate(tot_omzet_maand = sum(revenue)) %>% 
+  group_by(StoreID) %>% 
+  mutate(tot_omzet_maand_vorig_jaar = lag(tot_omzet_maand, n = 12))
+```
+
+```{r}
+#groeipercentage van de totale omzet
+groei_omzet_winkel<- groei_omzet_winkel %>%
+mutate(groei_maand_prop = (tot_omzet_maand -lag(tot_omzet_maand, 12)) /
+lag(tot_omzet_maand, 12)) %>%   
+mutate(groei_maand_perc = (100*(
+(tot_omzet_maand -lag(tot_omzet_maand, 12)) /
+lag(tot_omzet_maand, 12))))
+```
+
+Ik maak hier een overzicht van een jaar en maand voor de prestatie van winkels en wanneer ze goed of slecht presteren.
+*Maak een nieuwe kolom die werkt met een case_when. Wanneer groei_omzet_winkel < groei_maand dan presteert deze onder de maat en anders boven. Noem dit label prestatie.*
+```{r}
+prestatie_omzet <- groei_omzet_winkel %>% 
+  mutate(prestatie = case_when(
+    prop < groei_maand_prop ~ "Slecht",
+    prop >= groei_maand_prop ~ "Goed",
+    TRUE ~ "Eerste maand"
+  ))
+
+prestatie_omzet %>% 
+  filter(prestatie == "Goed") %>% 
+  summarise(revenue, prop, groei_maand_prop, prestatie, jaar, maand)
+```
+
+Winkel groei met de gemiddelde groei van alle winkels
+winkel A 2015 met winkel A 2016 verschil berekenen > gemiddelde groe = verschillen van alle winkels samen voor een jaar/ aantal waardes die niet NA zijn 
+
+
+```{r}
+#totale gem omzet groei per maand
+masterjoin <- masterjoin %>% 
+  filter(label == "Open") %>%
+  group_by(maand, jaar) %>%
+  summarise(maand_omzet =sum(revenue)) %>%
+  arrange(jaar, maand) %>% 
+  mutate(gemiddelde_groei_maand = (100*(maand_omzet -lag(maand_omzet, 12))/-lag(maand_omzet,12)))
+  
+
+# winkel omzet groei per maand
+masterjoin <- masterjoin %>% 
+  #filter(label == "Open") %>%
+  group_by(maand, jaar) %>%
+  mutate(maand_omzet = sum(revenue, na.rm = TRUE)) %>%
+  group_by(StoreID) %>% 
+  mutate(groei_maand_winkel = case_when(
+    ((label == "Open") & (lag(label == "Open", 12)) & ) ~ (maand_omzet -lag(maand_omzet, 12))/-lag(maand_omzet,12),
+    TRUE ~ NA_real_
+  )) %>% 
+  ungroup()
+```
+We willen het volgende zien:
+- De algemene prestatie van het bedrijf L4L
+- De prestatie van een storeID over de gehele periode
+- De prestatie van stores vergeleken met elkaar
+
+```{r}
+groei_omzet_winkel %>%
+  filter(StoreID == 38) %>% 
+  ggplot(aes(as.factor(maand), prop, fill = factor(jaar))) +
+  geom_col(position = "dodge")
+
+
+```
+```{r}
+masterjoin %>%
+filter(StoreID == 38) %>% 
+  ggplot(aes(as.factor(maand), prop, fill = factor(jaar))) +
+  geom_col(position = "dodge")
+```
+
+
